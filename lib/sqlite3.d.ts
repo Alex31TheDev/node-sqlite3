@@ -64,7 +64,7 @@ export const cached: {
 };
 
 export interface RunResult extends Statement {
-    lastID: number;
+    lastID: number | bigint;
     changes: number;
 }
 
@@ -91,6 +91,8 @@ export class Statement extends events.EventEmitter {
     each<T>(callback?: (err: Error | null, row: T) => void, complete?: (err: Error | null, count: number) => void): this;
     each<T>(params: any, callback?: (this: RunResult, err: Error | null, row: T) => void, complete?: (err: Error | null, count: number) => void): this;
     each(...params: any[]): this;
+
+    safeIntegers(safe?: boolean): this;
 }
 
 export class Database extends events.EventEmitter {
@@ -123,10 +125,11 @@ export class Database extends events.EventEmitter {
 
     serialize(callback?: () => void): void;
     parallelize(callback?: () => void): void;
+    defaultSafeIntegers(safe?: boolean): this;
 
     on(event: "trace", listener: (sql: string) => void): this;
     on(event: "profile", listener: (sql: string, time: number) => void): this;
-    on(event: "change", listener: (type: string, database: string, table: string, rowid: number) => void): this;
+    on(event: "change", listener: (type: string, database: string, table: string, rowid: number | bigint) => void): this;
     on(event: "error", listener: (err: Error) => void): this;
     on(event: "open" | "close", listener: () => void): this;
     on(event: string, listener: (...args: any[]) => void): this;

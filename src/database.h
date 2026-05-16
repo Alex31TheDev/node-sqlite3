@@ -4,8 +4,12 @@
 
 
 #include <assert.h>
+#include <condition_variable>
+#include <cmath>
+#include <mutex>
 #include <string>
 #include <queue>
+#include <vector>
 
 #include <sqlite3.h>
 #include <napi.h>
@@ -17,6 +21,38 @@ using namespace Napi;
 namespace node_sqlite3 {
 
 class Database;
+
+namespace CustomFunctionValues {
+    struct Value {
+        int type = SQLITE_NULL;
+        sqlite3_int64 integer = 0;
+        double floating = 0;
+        std::string text;
+        std::vector<char> blob;
+    };
+}
+
+struct CustomFunctionCall {
+    std::vector<CustomFunctionValues::Value> args;
+    CustomFunctionValues::Value result;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool safeIntegers = false;
+    bool done = false;
+    bool errored = false;
+    std::string error;
+};
+
+struct CustomFunction {
+    Database* db;
+    std::string name;
+    int argc;
+    bool deterministic;
+    Napi::ThreadSafeFunction callback;
+
+    CustomFunction(Database* db_, std::string name_, int argc_, bool deterministic_, Napi::ThreadSafeFunction callback_) :
+        db(db_), name(std::move(name_)), argc(argc_), deterministic(deterministic_), callback(std::move(callback_)) {}
+};
 
 
 class Database : public Napi::ObjectWrap<Database> {
@@ -147,10 +183,12 @@ protected:
     Napi::Value Serialize(const Napi::CallbackInfo& info);
     Napi::Value Parallelize(const Napi::CallbackInfo& info);
     Napi::Value Configure(const Napi::CallbackInfo& info);
+    Napi::Value CreateFunction(const Napi::CallbackInfo& info);
     Napi::Value Interrupt(const Napi::CallbackInfo& info);
 
     static void SetBusyTimeout(Baton* baton);
     static void SetLimit(Baton* baton);
+    Napi::Value DefaultSafeIntegers(const Napi::CallbackInfo& info);
 
     static void RegisterTraceCallback(Baton* baton);
     static void TraceCallback(void* db, const char* sql);
@@ -164,6 +202,18 @@ protected:
     static void UpdateCallback(void* db, int type, const char* database, const char* table, sqlite3_int64 rowid);
     static void UpdateCallback(Database* db, UpdateInfo* info);
 
+    static CustomFunctionValues::Value GetCustomFunctionArgument(sqlite3_value* value);
+    static Napi::Value CustomFunctionValueToJS(
+        Napi::Env env,
+        const CustomFunctionValues::Value& value,
+        bool safeIntegers
+    );
+    static bool CustomFunctionValueFromJS(Napi::Value value, CustomFunctionValues::Value* out, std::string* error);
+    static void SetCustomFunctionResult(sqlite3_context* context, const CustomFunctionValues::Value& value);
+    static void CallCustomFunction(Napi::Env env, Napi::Function callback, CustomFunctionCall* call);
+    static void InvokeCustomFunction(sqlite3_context* context, int argc, sqlite3_value** argv);
+    static void DestroyCustomFunction(void* function);
+
     void RemoveCallbacks();
 
 protected:
@@ -175,6 +225,7 @@ protected:
     unsigned int pending = 0;
 
     bool serialize = false;
+    bool safeIntegers = false;
 
     std::queue<Call*> queue;
 

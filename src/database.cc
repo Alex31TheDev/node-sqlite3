@@ -21,6 +21,8 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
         InstanceMethod("exec", &Database::Exec, napi_default_method),
         InstanceMethod("wait", &Database::Wait, napi_default_method),
         InstanceMethod("loadExtension", &Database::LoadExtension, napi_default_method),
+        InstanceMethod("createFunction", &Database::CreateFunction, napi_default_method),
+        InstanceMethod("defaultSafeIntegers", &Database::DefaultSafeIntegers, napi_default_method),
         InstanceMethod("serialize", &Database::Serialize, napi_default_method),
         InstanceMethod("parallelize", &Database::Parallelize, napi_default_method),
         InstanceMethod("configure", &Database::Configure, napi_default_method),
@@ -217,6 +219,25 @@ Napi::Value Database::Open(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, db->open);
 }
 
+Napi::Value Database::DefaultSafeIntegers(const Napi::CallbackInfo& info) {
+    auto env = info.Env();
+    auto* db = this;
+
+    bool safeIntegers = true;
+
+    if (info.Length() > 0 && !info[0].IsUndefined()) {
+        if (!info[0].IsBoolean()) {
+            Napi::TypeError::New(env, "Argument 0 must be a boolean").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+
+        safeIntegers = info[0].As<Napi::Boolean>().Value();
+    }
+
+    db->safeIntegers = safeIntegers;
+    return info.This();
+}
+
 Napi::Value Database::Close(const Napi::CallbackInfo& info) {
     auto env = info.Env();
     auto* db = this;
@@ -410,6 +431,83 @@ Napi::Value Database::Interrupt(const Napi::CallbackInfo& info) {
     return info.This();
 }
 
+Napi::Value Database::CreateFunction(const Napi::CallbackInfo& info) {
+    auto env = this->Env();
+    auto* db = this;
+
+    REQUIRE_ARGUMENT_STRING(0, name);
+    REQUIRE_ARGUMENT_FUNCTION(1, callback);
+    OPTIONAL_ARGUMENT_INTEGER(2, argc, -1);
+
+    bool deterministic = false;
+
+    if (info.Length() > 3 && !info[3].IsUndefined()) {
+        if (!info[3].IsBoolean()) {
+            Napi::TypeError::New(env, "Argument 3 must be a boolean").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+
+        deterministic = info[3].As<Napi::Boolean>().Value();
+    }
+
+    if (!db->open) {
+        Napi::Error::New(env, "Database is not open").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    if (db->closing) {
+        Napi::Error::New(env, "Database is closing").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    auto function = new CustomFunction(
+        db,
+        name,
+        argc,
+        deterministic,
+        Napi::ThreadSafeFunction::New(
+            env,
+            callback,
+            Napi::String::New(env, name),
+            0,
+            1
+        )
+    );
+
+    sqlite3_mutex* mtx = sqlite3_db_mutex(db->_handle);
+    sqlite3_mutex_enter(mtx);
+
+    int status = sqlite3_create_function_v2(
+        db->_handle,
+        function->name.c_str(),
+        function->argc,
+        SQLITE_UTF8 | (function->deterministic ? SQLITE_DETERMINISTIC : 0),
+        function,
+        Database::InvokeCustomFunction,
+        NULL,
+        NULL,
+        Database::DestroyCustomFunction
+    );
+
+    std::string message;
+
+    if (status != SQLITE_OK) {
+        message = sqlite3_errmsg(db->_handle);
+    }
+
+    sqlite3_mutex_leave(mtx);
+
+    if (status != SQLITE_OK) {
+        function->callback.Release();
+        delete function;
+
+        Napi::Error::New(env, message.c_str()).ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    return info.This();
+}
+
 void Database::SetBusyTimeout(Baton* b) {
     auto baton = std::unique_ptr<Baton>(b);
 
@@ -543,15 +641,248 @@ void Database::UpdateCallback(Database *db, UpdateInfo* i) {
     auto info = std::unique_ptr<UpdateInfo>(i);
     auto env = db->Env();
     Napi::HandleScope scope(env);
+    Napi::Value rowid = db->safeIntegers
+        ? Napi::BigInt::New(env, info->rowid).As<Napi::Value>()
+        : Napi::Number::New(env, info->rowid).As<Napi::Value>();
 
     Napi::Value argv[] = {
         Napi::String::New(env, "change"),
         Napi::String::New(env, sqlite_authorizer_string(info->type)),
         Napi::String::New(env, info->database.c_str()),
         Napi::String::New(env, info->table.c_str()),
-        Napi::Number::New(env, info->rowid),
+        rowid,
     };
     EMIT_EVENT(db->Value(), 5, argv);
+}
+
+CustomFunctionValues::Value Database::GetCustomFunctionArgument(sqlite3_value* value) {
+    CustomFunctionValues::Value out;
+    out.type = sqlite3_value_type(value);
+
+    switch (out.type) {
+        case SQLITE_INTEGER:
+            out.integer = sqlite3_value_int64(value);
+            break;
+        case SQLITE_FLOAT:
+            out.floating = sqlite3_value_double(value);
+            break;
+        case SQLITE_TEXT: {
+            const char* text = reinterpret_cast<const char*>(sqlite3_value_text(value));
+            int length = sqlite3_value_bytes(value);
+            out.text.assign(text != NULL ? text : "", length);
+            break;
+        }
+        case SQLITE_BLOB: {
+            const char* blob = static_cast<const char*>(sqlite3_value_blob(value));
+            int length = sqlite3_value_bytes(value);
+
+            if (blob != NULL && length > 0) {
+                out.blob.assign(blob, blob + length);
+            }
+            break;
+        }
+        case SQLITE_NULL:
+        default:
+            out.type = SQLITE_NULL;
+            break;
+    }
+
+    return out;
+}
+
+Napi::Value Database::CustomFunctionValueToJS(
+    Napi::Env env,
+    const CustomFunctionValues::Value& value,
+    bool safeIntegers
+) {
+    switch (value.type) {
+        case SQLITE_INTEGER: {
+            Napi::Value integerValue = safeIntegers
+                ? Napi::BigInt::New(env, value.integer).As<Napi::Value>()
+                : Napi::Number::New(env, static_cast<double>(value.integer)).As<Napi::Value>();
+
+            return integerValue;
+        }
+        case SQLITE_FLOAT:
+            return Napi::Number::New(env, value.floating);
+        case SQLITE_TEXT:
+            return Napi::String::New(env, value.text.c_str(), value.text.size());
+        case SQLITE_BLOB:
+            return Napi::Buffer<char>::Copy(env, value.blob.data(), value.blob.size());
+        case SQLITE_NULL:
+        default:
+            return env.Null();
+    }
+}
+
+bool Database::CustomFunctionValueFromJS(Napi::Value value, CustomFunctionValues::Value* out, std::string* error) {
+    if (value.IsUndefined() || value.IsNull()) {
+        out->type = SQLITE_NULL;
+        return true;
+    }
+
+    if (value.IsBuffer()) {
+        auto buffer = value.As<Napi::Buffer<char>>();
+        out->type = SQLITE_BLOB;
+        out->blob.assign(buffer.Data(), buffer.Data() + buffer.Length());
+        return true;
+    }
+
+    if (value.IsString()) {
+        out->type = SQLITE_TEXT;
+        out->text = value.As<Napi::String>().Utf8Value();
+        return true;
+    }
+
+    if (value.IsBoolean()) {
+        out->type = SQLITE_INTEGER;
+        out->integer = value.As<Napi::Boolean>().Value() ? 1 : 0;
+        return true;
+    }
+
+    if (value.IsNumber()) {
+        double number = value.As<Napi::Number>().DoubleValue();
+
+        if (std::isfinite(number) && std::floor(number) == number) {
+            out->type = SQLITE_INTEGER;
+            out->integer = static_cast<sqlite3_int64>(number);
+        } else {
+            out->type = SQLITE_FLOAT;
+            out->floating = number;
+        }
+
+        return true;
+    }
+
+    if (value.IsBigInt()) {
+        bool lossless = false;
+        sqlite3_int64 integer = value.As<Napi::BigInt>().Int64Value(&lossless);
+
+        if (!lossless) {
+            if (error != NULL) {
+                *error = "BigInt value is too large to store in SQLite INTEGER";
+            }
+
+            return false;
+        }
+
+        out->type = SQLITE_INTEGER;
+        out->integer = integer;
+        return true;
+    }
+
+    if (error != NULL) {
+        *error = "Unsupported custom function return type";
+    }
+
+    return false;
+}
+
+void Database::SetCustomFunctionResult(sqlite3_context* context, const CustomFunctionValues::Value& value) {
+    switch (value.type) {
+        case SQLITE_INTEGER:
+            sqlite3_result_int64(context, value.integer);
+            break;
+        case SQLITE_FLOAT:
+            sqlite3_result_double(context, value.floating);
+            break;
+        case SQLITE_TEXT:
+            sqlite3_result_text(context, value.text.c_str(), value.text.size(), SQLITE_TRANSIENT);
+            break;
+        case SQLITE_BLOB:
+            sqlite3_result_blob(
+                context,
+                value.blob.empty() ? "" : value.blob.data(),
+                value.blob.size(),
+                SQLITE_TRANSIENT
+            );
+            break;
+        case SQLITE_NULL:
+        default:
+            sqlite3_result_null(context);
+            break;
+    }
+}
+
+void Database::CallCustomFunction(Napi::Env env, Napi::Function callback, CustomFunctionCall* call) {
+    Napi::HandleScope scope(env);
+
+    std::vector<napi_value> args;
+    args.reserve(call->args.size());
+
+    for (const auto& arg : call->args) {
+        args.emplace_back(Database::CustomFunctionValueToJS(env, arg, call->safeIntegers));
+    }
+
+    std::string error;
+
+    try {
+        Napi::Value result = callback.Call(env.Undefined(), args);
+
+        if (result.IsEmpty() || env.IsExceptionPending()) {
+            auto exception = env.GetAndClearPendingException();
+            error = exception.Value().ToString().Utf8Value();
+            call->errored = true;
+        } else if (!Database::CustomFunctionValueFromJS(result, &call->result, &error)) {
+            call->errored = true;
+        }
+    } catch (const std::exception& err) {
+        error = err.what();
+        call->errored = true;
+    }
+
+    if (call->errored) {
+        call->error = error.empty() ? "Custom function execution failed" : error;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(call->mutex);
+        call->done = true;
+    }
+
+    call->condition.notify_one();
+}
+
+void Database::InvokeCustomFunction(sqlite3_context* context, int argc, sqlite3_value** argv) {
+    auto* function = static_cast<CustomFunction*>(sqlite3_user_data(context));
+    CustomFunctionCall call;
+    call.safeIntegers = function->db->safeIntegers;
+    call.args.reserve(argc);
+
+    for (int index = 0; index < argc; index++) {
+        call.args.emplace_back(Database::GetCustomFunctionArgument(argv[index]));
+    }
+
+    napi_status status = function->callback.BlockingCall(&call, Database::CallCustomFunction);
+
+    if (status != napi_ok) {
+        sqlite3_result_error(context, "Failed to invoke custom function", -1);
+        return;
+    }
+
+    std::unique_lock<std::mutex> lock(call.mutex);
+    call.condition.wait(lock, [&call]() {
+        return call.done;
+    });
+    lock.unlock();
+
+    if (call.errored) {
+        sqlite3_result_error(context, call.error.c_str(), -1);
+        return;
+    }
+
+    Database::SetCustomFunctionResult(context, call.result);
+}
+
+void Database::DestroyCustomFunction(void* function) {
+    auto* customFunction = static_cast<CustomFunction*>(function);
+
+    if (customFunction == NULL) {
+        return;
+    }
+
+    customFunction->callback.Release();
+    delete customFunction;
 }
 
 Napi::Value Database::Exec(const Napi::CallbackInfo& info) {

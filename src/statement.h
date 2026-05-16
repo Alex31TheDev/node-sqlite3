@@ -203,6 +203,7 @@ public:
     WORK_DEFINITION(Reset)
 
     Napi::Value Finalize_(const Napi::CallbackInfo& info);
+    Napi::Value SafeIntegers(const Napi::CallbackInfo& info);
 
 protected:
     static void Work_BeginPrepare(Database::Baton* baton);
@@ -220,7 +221,7 @@ protected:
     bool Bind(const Parameters &parameters);
 
     static void GetRow(Row* row, sqlite3_stmt* stmt);
-    static Napi::Value RowToJS(Napi::Env env, Row* row);
+    static Napi::Value RowToJS(Napi::Env env, Row* row, bool safeIntegers);
     void Schedule(Work_Callback callback, Baton* baton);
     void Process();
     void CleanQueue();
@@ -234,6 +235,7 @@ protected:
     bool prepared = false;
     bool locked = true;
     bool finalized = false;
+    bool safeIntegers = false;
 
     std::queue<Call*> queue;
     std::string message;
