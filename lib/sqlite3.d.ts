@@ -63,6 +63,8 @@ export const cached: {
     Database(filename: string, mode?: number, callback?: (this: Database, err: Error | null) => void): Database;
 };
 
+export function sanitize(value: string | null, type?: "string" | "identifier"): string;
+
 export interface RunResult extends Statement {
     lastID: number | bigint;
     changes: number;
@@ -204,5 +206,6 @@ export interface sqlite3 {
     RunResult: RunResult;
     Statement: typeof Statement;
     Database: typeof Database;
+    sanitize(value: string | null, type?: "string" | "identifier"): string;
     verbose(): this;
 }

@@ -13,12 +13,69 @@ using namespace node_sqlite3;
 
 namespace {
 
+Napi::Value Sanitize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || (!info[0].IsString() && !info[0].IsNull())) {
+        Napi::TypeError::New(env, "Argument 0 must be a string or null").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    std::string type = "string";
+
+    if (info.Length() > 1) {
+        if (!info[1].IsString()) {
+            Napi::TypeError::New(env, "Argument 1 must be a string").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+
+        type = info[1].As<Napi::String>();
+    }
+
+    char* sanitized;
+
+    if (type == "string") {
+        std::string stringValue;
+        const char* value = NULL;
+
+        if (!info[0].IsNull()) {
+            stringValue = info[0].As<Napi::String>().Utf8Value();
+            value = stringValue.c_str();
+        }
+
+        sanitized = sqlite3_mprintf("%Q", value);
+    } else if (type == "identifier") {
+        if (info[0].IsNull()) {
+            Napi::TypeError::New(env, "Argument 0 must be a string").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+
+        std::string identifier = info[0].As<Napi::String>().Utf8Value();
+        sanitized = sqlite3_mprintf("\"%w\"", identifier.c_str());
+    } else {
+        Napi::TypeError::New(env, "Unsupported sanitize type").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    if (sanitized == NULL) {
+        Napi::Error::New(env, "Could not sanitize value").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    Napi::String result = Napi::String::New(env, sanitized);
+    sqlite3_free(sanitized);
+
+    return result;
+}
+
 Napi::Object RegisterModule(Napi::Env env, Napi::Object exports) {
     Napi::HandleScope scope(env);
 
     Database::Init(env, exports);
     Statement::Init(env, exports);
     Backup::Init(env, exports);
+
+    exports.Set("sanitize", Napi::Function::New(env, Sanitize));
 
     exports.DefineProperties({
         DEFINE_CONSTANT_INTEGER(exports, SQLITE_OPEN_READONLY, OPEN_READONLY)
